@@ -30,9 +30,7 @@ func timeChecker(waitData chan bool) {
 		if time.Now().Second() == 0 {
 			select {
 			case waitData <- true:
-				continue
 			default:
-				continue
 			}
 		}
 	}

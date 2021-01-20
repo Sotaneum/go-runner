@@ -50,16 +50,12 @@ func (runner *Runner) dispatchData(dataChan chan []RunData) {
 		case prevData = <-dataChan:
 			select {
 			case runner.nextDataChan <- prevData:
-				continue
 			default:
-				continue
 			}
 		default:
 			select {
 			case runner.nextDataChan <- prevData:
-				continue
 			default:
-				continue
 			}
 		}
 	}
@@ -77,16 +73,12 @@ func (runner *Runner) dispatchParams(paramChan chan map[string]string) {
 		case prevParams = <-paramChan:
 			select {
 			case runner.paramChan <- prevParams:
-				continue
 			default:
-				continue
 			}
 		default:
 			select {
 			case runner.paramChan <- prevParams:
-				continue
 			default:
-				continue
 			}
 		}
 	}
@@ -95,8 +87,6 @@ func (runner *Runner) dispatchParams(paramChan chan map[string]string) {
 func (runner *Runner) setResultData(result map[string]interface{}) {
 	select {
 	case runner.ResultChan <- result:
-		return
 	default:
-		return
 	}
 }
