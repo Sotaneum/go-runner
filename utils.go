@@ -6,13 +6,19 @@ import "time"
 func NewRunner(dataChan chan []RunData, paramDataChan chan map[string]string) *Runner {
 	runner := new(Runner)
 
+	runner.waitChan = make(chan bool)
 	runner.nextDataChan = make(chan []RunData)
 	runner.queueDataChan = make(chan []RunData)
+	runner.paramChan = make(chan map[string]string)
 	runner.ResultChan = make(chan map[string]interface{})
 
-	go runner.dispatchData(dataChan, paramDataChan)
 	go runner.start()
 	go runner.createQueue()
+	go runner.dispatchData(dataChan)
+	go runner.dispatchParams(paramDataChan)
+
+	// 0초가 되었을 때 반복할 수 있도록 합니다.
+	go timeChecker(runner.waitChan)
 
 	return runner
 }
@@ -22,7 +28,12 @@ func timeChecker(waitData chan bool) {
 	for true {
 		time.Sleep(time.Second)
 		if time.Now().Second() == 0 {
-			waitData <- true
+			select {
+			case waitData <- true:
+				continue
+			default:
+				continue
+			}
 		}
 	}
 }
