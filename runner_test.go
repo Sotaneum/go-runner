@@ -1,10 +1,10 @@
-package go_runner_test
+package runner_test
 
 import (
 	"testing"
 	"time"
 
-	runner "github.com/Sotaneum/go-runner"
+	"github.com/Sotaneum/go-runner"
 )
 
 type data struct {

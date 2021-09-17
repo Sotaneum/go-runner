@@ -1,4 +1,4 @@
-package go_runner
+package runner
 
 import "time"
 
