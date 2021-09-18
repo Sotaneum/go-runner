@@ -1,10 +1,14 @@
 package runner
 
-import "time"
+import (
+	"time"
+
+	ktime "github.com/Sotaneum/go-kst-time"
+)
 
 // RunnerInterface : Runner 인터페이스입니다.
 type RunnerInterface interface {
-	IsRun() bool
+	IsRun(t time.Time) bool
 	GetID() string
 	Run() interface{}
 }
@@ -39,12 +43,12 @@ func (runner *Runner) createQueue() {
 	for {
 		// 0초마다 실행하도록 합니다.
 		<-runner.waitCh
-
+		now := ktime.GetNow()
 		runners := <-runner.nextCh
 		queue := []RunnerInterface{}
 		// runner가 지금 실행해야하는 것인지를 확인하고 queue에 추가합니다.
 		for _, item := range runners {
-			if item.IsRun() {
+			if item.IsRun(now) {
 				queue = append(queue, item)
 			}
 		}

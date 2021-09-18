@@ -1,6 +1,7 @@
 package runner_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -28,7 +29,8 @@ func (d *data) Run() interface{} {
 	return "{code:200}"
 }
 
-func (d *data) IsRun() bool {
+func (d *data) IsRun(t time.Time) bool {
+	fmt.Println(t)
 	return d.use
 }
 
