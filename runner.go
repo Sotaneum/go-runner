@@ -6,8 +6,8 @@ import (
 	ktime "github.com/Sotaneum/go-kst-time"
 )
 
-// RunnerInterface : Runner 인터페이스입니다.
-type RunnerInterface interface {
+// JobInterface : Runner 인터페이스입니다.
+type JobInterface interface {
 	IsRun(t time.Time) bool
 	GetID() string
 	Run() interface{}
@@ -16,8 +16,8 @@ type RunnerInterface interface {
 // Runner : Runner 객체입니다.
 type Runner struct {
 	waitCh   chan bool
-	nextCh   chan []RunnerInterface
-	queueCh  chan []RunnerInterface
+	nextCh   chan []JobInterface
+	queueCh  chan []JobInterface
 	ResultCh chan map[string]interface{}
 }
 
@@ -45,7 +45,7 @@ func (runner *Runner) createQueue() {
 		<-runner.waitCh
 		now := ktime.GetNow()
 		runners := <-runner.nextCh
-		queue := []RunnerInterface{}
+		queue := []JobInterface{}
 		// runner가 지금 실행해야하는 것인지를 확인하고 queue에 추가합니다.
 		for _, item := range runners {
 			if item.IsRun(now) {
@@ -57,9 +57,9 @@ func (runner *Runner) createQueue() {
 	}
 }
 
-func (runner *Runner) dispatchRunner(runnerCh chan []RunnerInterface) {
+func (runner *Runner) dispatchRunner(runnerCh chan []JobInterface) {
 	// 빈 Runner 값을 생성합니다.
-	prevRunner := []RunnerInterface{}
+	prevRunner := []JobInterface{}
 	for {
 		// 과부하를 방지하기 위해 Second마다 새로운 Runner를 확인합니다.
 		time.Sleep(time.Second)
@@ -91,12 +91,12 @@ func (runner *Runner) setResult(result map[string]interface{}) {
 }
 
 // NewRunner : Runner를 생성합니다. runner.ResultCh 통해 실행 결과를 알 수 있습니다.
-func NewRunner(runnerCh chan []RunnerInterface) *Runner {
+func NewRunner(runnerCh chan []JobInterface) *Runner {
 	runner := new(Runner)
 
 	runner.waitCh = make(chan bool)
-	runner.nextCh = make(chan []RunnerInterface)
-	runner.queueCh = make(chan []RunnerInterface)
+	runner.nextCh = make(chan []JobInterface)
+	runner.queueCh = make(chan []JobInterface)
 	runner.ResultCh = make(chan map[string]interface{})
 
 	go runner.start()

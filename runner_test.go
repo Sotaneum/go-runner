@@ -35,7 +35,7 @@ func (d *data) IsRun(t time.Time) bool {
 }
 
 func TestRunner(t *testing.T) {
-	runnerCh := make(chan []runner.RunnerInterface)
+	runnerCh := make(chan []runner.JobInterface)
 	run := runner.NewRunner(runnerCh)
 
 	runnerObj1 := new(data)
@@ -45,7 +45,7 @@ func TestRunner(t *testing.T) {
 	runnerObj2.SetID("test2")
 	runnerObj2.SetUse(false)
 
-	runners := []runner.RunnerInterface{}
+	runners := []runner.JobInterface{}
 	runners = append(runners, runnerObj1)
 	runners = append(runners, runnerObj2)
 
