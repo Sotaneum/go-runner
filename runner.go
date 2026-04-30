@@ -108,10 +108,17 @@ func (r *Runner) InFlightIDs() []string {
 }
 
 // Push sends a batch to the runner without requiring the caller to manage
-// the runnerCh channel directly. Equivalent to sending on the channel passed
-// to NewRunner. Blocks if the internal batch FIFO is full (backpressure).
-func (r *Runner) Push(batch []JobInterface) {
-	r.runnerCh <- batch
+// the runnerCh channel directly. Returns true if the batch was accepted,
+// false if Stop has been called (in which case the batch is discarded).
+// Blocks if the internal batch FIFO is full (backpressure) until either a
+// slot frees up or Stop is called.
+func (r *Runner) Push(batch []JobInterface) bool {
+	select {
+	case r.runnerCh <- batch:
+		return true
+	case <-r.done:
+		return false
+	}
 }
 
 // PushAndAwait runs a batch immediately (without waiting for the next minute

@@ -36,6 +36,15 @@ func (e *PanicError) Error() string {
 	return fmt.Sprintf("runner: job %q panicked: %v", e.ID, e.Recovered)
 }
 
+// Unwrap exposes the underlying error if Run() panicked with one (e.g.
+// panic(io.EOF)), enabling errors.Is / errors.As against the recovered value.
+func (e *PanicError) Unwrap() error {
+	if err, ok := e.Recovered.(error); ok {
+		return err
+	}
+	return nil
+}
+
 // JobInterface is the contract a runnable job must satisfy.
 //
 // Run returns the value and an optional error. The value lands in

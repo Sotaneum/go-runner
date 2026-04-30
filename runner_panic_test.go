@@ -42,6 +42,26 @@ func TestRunQueueRecoversPanic(t *testing.T) {
 	}
 }
 
+type panicWithErrJob struct {
+	id  string
+	err error
+}
+
+func (j *panicWithErrJob) GetID() string          { return j.id }
+func (j *panicWithErrJob) IsRun(t time.Time) bool { return true }
+func (j *panicWithErrJob) Run() (any, error)      { panic(j.err) }
+
+func TestPanicErrorUnwrap(t *testing.T) {
+	r := newTestRunner(t, 5)
+	want := errors.New("io: closed")
+	r.queueCh <- batchEnvelope{jobs: []JobInterface{&panicWithErrJob{id: "p", err: want}}}
+	res := <-r.ResultCh
+	jr := res.Items[0]
+	if !errors.Is(jr.Err, want) {
+		t.Errorf("errors.Is(jr.Err, want) = false, want true (jr.Err=%v)", jr.Err)
+	}
+}
+
 func TestRunReturnsErrorPropagated(t *testing.T) {
 	r := newTestRunner(t, 5)
 	want := errors.New("io: closed")

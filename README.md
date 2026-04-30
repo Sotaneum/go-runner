@@ -117,7 +117,7 @@ runnerCh <- batch
 
 // 2) library-managed channel
 r := runner.New(10)
-r.Push(batch)
+ok := r.Push(batch) // false if Stop has been called
 ```
 
 For synchronous, immediate execution of a single batch (no tick wait) and per-batch correlation:
@@ -212,7 +212,7 @@ s := r.Stats()
 | `NewRunner(runnerCh)` | Create a runner with the default concurrency limit (50). |
 | `NewRunnerWithLimit(runnerCh, limit, opts...)` | Create with custom limit and options. Panics if `runnerCh` is nil. `limit <= 0` normalizes to default. |
 | `New(limit, opts...)` | Create a runner with an internally-managed channel. Use `Push` / `PushAndAwait` to submit batches. |
-| `(*Runner).Push(batch)` | Send a batch to the runner without managing the channel directly. |
+| `(*Runner).Push(batch)` | Send a batch. Returns `false` if the runner has been stopped. |
 | `(*Runner).PushAndAwait(batch)` | Run a batch immediately (no tick wait), evaluating `IsRun(now)` once. Returns a per-batch result channel. |
 | `(*Runner).Stop()` | Stop lifecycle goroutines, wait for them to exit. Idempotent. |
 | `(*Runner).Wait()` | Block until in-flight queues complete, then close `ResultCh`. |
@@ -244,7 +244,8 @@ type JobInterface interface {
 Runnable programs in `examples/`:
 
 - [`examples/basic`](./examples/basic) — minimal usage
-- [`examples/dedupe`](./examples/dedupe) — `WithDedupe()` + `Stats`
+- [`examples/dedupe`](./examples/dedupe) — `WithDedupe()` + dedupe skip
+- [`examples/with-stats`](./examples/with-stats) — `Stats()` monitoring + `PushAndAwait`
 
 ## Testing
 

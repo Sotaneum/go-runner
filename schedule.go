@@ -10,7 +10,9 @@ import (
 
 // createQueue : 매 분 tick마다 batches에서 envelope 1개를 pop하고
 // IsRun(now) 평가 후 queueCh로 전달. 없으면 그 tick은 스킵한다.
+// 종료 시 남아있는 envelope들을 drain하여 PushAndAwait reply 채널을 닫고 leak을 방지한다.
 func (r *Runner) createQueue() {
+	defer r.drainBatches()
 	for {
 		select {
 		case <-r.done:
@@ -37,6 +39,21 @@ func (r *Runner) createQueue() {
 		case <-r.done:
 			return
 		case r.queueCh <- env:
+		}
+	}
+}
+
+// drainBatches : Stop 후 batches에 남은 envelope들을 비운다.
+// PushAndAwait reply 채널이 있으면 닫아 호출자가 무한 대기하지 않게 한다.
+func (r *Runner) drainBatches() {
+	for {
+		select {
+		case env := <-r.batches:
+			if env.replyCh != nil {
+				close(env.replyCh)
+			}
+		default:
+			return
 		}
 	}
 }
