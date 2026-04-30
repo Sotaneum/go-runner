@@ -41,11 +41,11 @@ func newTestRunner(limit int) *Runner {
 	}
 	r := &Runner{
 		waitCh:   make(chan bool),
-		nextCh:   make(chan []JobInterface),
 		queueCh:  make(chan []JobInterface),
 		ResultCh: make(chan map[string]interface{}, 16),
 		limit:    limit,
 		sem:      make(chan struct{}, limit),
+		done:     make(chan struct{}),
 	}
 	go r.start()
 	return r
@@ -115,6 +115,7 @@ func TestNewRunnerWithLimitFallback(t *testing.T) {
 			ResultCh: make(chan map[string]interface{}, 1),
 			limit:    effective,
 			sem:      make(chan struct{}, effective),
+			done:     make(chan struct{}),
 		}
 		go r.start()
 		r.queueCh <- []JobInterface{&concJob{id: "x"}}
@@ -245,7 +246,91 @@ func TestNewRunnerCompat(t *testing.T) {
 	// 컴파일 가능 + 패닉 없이 생성되는지 확인
 	ch := make(chan []JobInterface)
 	r := NewRunner(ch)
+	defer r.Stop()
 	if r.limit != defaultConcurrencyLimit {
 		t.Errorf("NewRunner limit = %d, want %d", r.limit, defaultConcurrencyLimit)
+	}
+}
+
+type slowCountJob struct {
+	id      string
+	count   *atomic.Int32
+	release chan struct{}
+}
+
+func (j *slowCountJob) GetID() string         { return j.id }
+func (j *slowCountJob) IsRun(t time.Time) bool { return true }
+func (j *slowCountJob) Run() interface{} {
+	j.count.Add(1)
+	if j.release != nil {
+		<-j.release
+	}
+	return j.id
+}
+
+func TestWithDedupeSkipsInFlight(t *testing.T) {
+	r := newTestRunner(10)
+	r.dedupe = true
+	r.inFlight = make(map[string]struct{})
+
+	var count atomic.Int32
+	release := make(chan struct{})
+	queue := []JobInterface{
+		&slowCountJob{id: "dup", count: &count, release: release},
+		&slowCountJob{id: "dup", count: &count, release: release}, // 중복 — 스킵되어야 함
+		&slowCountJob{id: "uniq", count: &count, release: release},
+	}
+	r.queueCh <- queue
+	// 두 Job(dup 1번 + uniq)이 release 대기 중인지 확인
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case res := <-r.ResultCh:
+		if len(res) != 2 {
+			t.Errorf("expected 2 results (dup + uniq, 2nd dup skipped), got %d: %v", len(res), res)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ResultCh timeout")
+	}
+	if c := count.Load(); c != 2 {
+		t.Errorf("Run() invocations = %d, want 2", c)
+	}
+}
+
+func TestNewRunnerWithLimitOptions(t *testing.T) {
+	ch := make(chan []JobInterface)
+	r := NewRunnerWithLimit(ch, 5, WithDedupe(), WithBatchBuffer(10))
+	defer r.Stop()
+	if !r.dedupe {
+		t.Error("WithDedupe not applied")
+	}
+	if r.batchBufferSize != 10 {
+		t.Errorf("batchBufferSize = %d, want 10", r.batchBufferSize)
+	}
+	if cap(r.batches) != 10 {
+		t.Errorf("batches cap = %d, want 10", cap(r.batches))
+	}
+}
+
+func TestWithBatchBufferBackpressure(t *testing.T) {
+	ch := make(chan []JobInterface)
+	r := NewRunnerWithLimit(ch, 1, WithBatchBuffer(2))
+	defer r.Stop()
+
+	// 내부 큐 용량 2 + ingest 고루틴이 1개 임시로 들고 있을 수 있어 총 3개까지 즉시 수용 가능
+	for i := 0; i < 3; i++ {
+		select {
+		case ch <- []JobInterface{&concJob{id: fmt.Sprintf("j%d", i)}}:
+		case <-time.After(200 * time.Millisecond):
+			t.Fatalf("push %d 블로킹 — 큐가 즉시 수용해야 함", i)
+		}
+	}
+	// 4번째는 큐가 가득 + ingest도 막혀서 블로킹되어야 함 (다음 분 tick 전까지 빠지지 않음)
+	select {
+	case ch <- []JobInterface{&concJob{id: "blocked"}}:
+		t.Error("4번째 push가 블로킹되어야 하는데 즉시 수용됨")
+	case <-time.After(200 * time.Millisecond):
+		// 기대된 블로킹
 	}
 }
