@@ -35,7 +35,7 @@ func BenchmarkRunQueue_100Jobs(b *testing.B) {
 	q := makeQueue(100)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r.queueCh <- q
+		r.queueCh <- batchEnvelope{jobs: q}
 		<-r.ResultCh
 	}
 }
@@ -45,7 +45,7 @@ func BenchmarkRunQueue_1000Jobs(b *testing.B) {
 	q := makeQueue(1000)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r.queueCh <- q
+		r.queueCh <- batchEnvelope{jobs: q}
 		<-r.ResultCh
 	}
 }
@@ -55,7 +55,7 @@ func BenchmarkRunQueue_Dedupe(b *testing.B) {
 	q := makeQueue(100)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		r.queueCh <- q
+		r.queueCh <- batchEnvelope{jobs: q}
 		<-r.ResultCh
 	}
 }

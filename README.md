@@ -105,6 +105,28 @@ Sets the size of the internal FIFO queue that holds batches received from `runne
 - If the caller pushes batches faster than they are consumed, the queue fills and subsequent `runnerCh` sends **block**, providing natural backpressure. The caller does not need to manually pace itself.
 - If `IsRun(now)` returns false at the time the batch is finally dequeued (e.g. it lagged behind), that job is dropped from the queue.
 
+## Submitting Batches
+
+Two equivalent ways:
+
+```go
+// 1) caller-owned channel
+runnerCh := make(chan []runner.JobInterface)
+r := runner.NewRunnerWithLimit(runnerCh, 10)
+runnerCh <- batch
+
+// 2) library-managed channel
+r := runner.New(10)
+r.Push(batch)
+```
+
+For synchronous, immediate execution of a single batch (no tick wait) and per-batch correlation:
+
+```go
+reply := r.PushAndAwait(batch)
+res := <-reply // closed after delivery
+```
+
 ## Result and Errors
 
 ```go
@@ -127,6 +149,14 @@ type PanicError struct {
     Recovered any
     Stack     []byte
 }
+```
+
+`Result` provides convenience helpers:
+
+```go
+res.ByID()          // map[string]JobResult — O(1) lookup by ID
+res.Errors()        // map[string]error — only entries with Err != nil
+res.PanicErrors()   // map[string]*PanicError — panics only
 ```
 
 Distinguish error sources with `errors.As` / `errors.Is`:
@@ -181,6 +211,9 @@ s := r.Stats()
 |---|---|
 | `NewRunner(runnerCh)` | Create a runner with the default concurrency limit (50). |
 | `NewRunnerWithLimit(runnerCh, limit, opts...)` | Create with custom limit and options. Panics if `runnerCh` is nil. `limit <= 0` normalizes to default. |
+| `New(limit, opts...)` | Create a runner with an internally-managed channel. Use `Push` / `PushAndAwait` to submit batches. |
+| `(*Runner).Push(batch)` | Send a batch to the runner without managing the channel directly. |
+| `(*Runner).PushAndAwait(batch)` | Run a batch immediately (no tick wait), evaluating `IsRun(now)` once. Returns a per-batch result channel. |
 | `(*Runner).Stop()` | Stop lifecycle goroutines, wait for them to exit. Idempotent. |
 | `(*Runner).Wait()` | Block until in-flight queues complete, then close `ResultCh`. |
 | `(*Runner).StopAndWait()` | `Stop` + `Wait`. After this returns no goroutine from this runner remains. |
@@ -189,6 +222,8 @@ s := r.Stats()
 | `(*Runner).ResultCh` | Buffered receive channel of `Result`. |
 | `WithDedupe()` | Skip duplicate in-flight IDs. |
 | `WithBatchBuffer(n)` | Set internal batch FIFO size. |
+| `WithOnPanic(fn)` | Callback invoked on `Run()` panics (synchronous). |
+| `WithOnSkip(fn)` | Callback invoked when a job is skipped by dedupe (synchronous). |
 | `ErrSkippedDuplicate` | Sentinel error for dedupe skips. |
 | `PanicError` | Wraps a recovered `Run()` panic with `Recovered` and `Stack`. |
 
