@@ -55,9 +55,24 @@ func (r *Runner) runQueue(env batchEnvelope) {
 			})
 			continue
 		}
-		wg.Add(1)
 		// 전역 세마포어: 슬롯이 빌 때까지 블로킹 대기.
-		r.sem <- struct{}{}
+		// Stop이 호출되면 슬롯을 기다리지 않고 ErrShuttingDown으로 결과를 채워 즉시 종료한다.
+		select {
+		case r.sem <- struct{}{}:
+		case <-r.done:
+			if r.dedupe {
+				r.unmarkInFlight(item.GetID())
+			}
+			now := time.Now()
+			appendResult(JobResult{
+				ID:        item.GetID(),
+				Err:       ErrShuttingDown,
+				StartedAt: now,
+				EndedAt:   now,
+			})
+			continue
+		}
+		wg.Add(1)
 		go func(j JobInterface) {
 			defer wg.Done()
 			defer func() { <-r.sem }()

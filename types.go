@@ -24,6 +24,10 @@ const defaultBatchBuffer = 64
 // and a job's GetID() is already in flight.
 var ErrSkippedDuplicate = errors.New("runner: skipped duplicate in-flight job")
 
+// ErrShuttingDown is reported in JobResult.Err for jobs that were not started
+// because Stop was called while they were waiting for a concurrency slot.
+var ErrShuttingDown = errors.New("runner: shutting down before job started")
+
 // PanicError wraps a recovered panic from Run(). It carries the original
 // recovered value and the captured stack trace.
 type PanicError struct {

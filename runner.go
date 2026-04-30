@@ -134,8 +134,9 @@ func (r *Runner) Push(batch []JobInterface) bool {
 func (r *Runner) PushAndAwait(batch []JobInterface) <-chan Result {
 	reply := make(chan Result, 1)
 	r.stoppedMu.RLock()
-	defer r.stoppedMu.RUnlock()
-	if r.stopped {
+	stopped := r.stopped
+	r.stoppedMu.RUnlock()
+	if stopped {
 		close(reply)
 		return reply
 	}
@@ -146,7 +147,13 @@ func (r *Runner) PushAndAwait(batch []JobInterface) <-chan Result {
 			filtered = append(filtered, j)
 		}
 	}
-	r.queueCh <- batchEnvelope{jobs: filtered, replyCh: reply}
+	// done과 함께 select하여 Stop이 동시에 호출되어도 영구 블록되지 않도록 한다.
+	// RLock은 송신 전에 풀어야 한다 — 잡고 있으면 Stop의 Lock이 막혀 done이 닫히지 않는 데드락이 된다.
+	select {
+	case r.queueCh <- batchEnvelope{jobs: filtered, replyCh: reply}:
+	case <-r.done:
+		close(reply)
+	}
 	return reply
 }
 
