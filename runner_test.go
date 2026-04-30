@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package runner_test
 
 import (
@@ -7,19 +9,10 @@ import (
 	"github.com/Sotaneum/go-runner"
 )
 
-type data struct {
-	id  string
-	use bool
-}
-
-func (d *data) GetID() string          { return d.id }
-func (d *data) IsRun(t time.Time) bool { return d.use }
-func (d *data) Run() any               { return "{code:200}" }
-
 func TestNewRunner(t *testing.T) {
 	ch := make(chan []runner.JobInterface)
 	r := runner.NewRunner(ch)
-	defer r.Stop()
+	defer r.StopAndWait()
 	if r == nil {
 		t.Fatal("NewRunner returned nil")
 	}
@@ -31,7 +24,7 @@ func TestNewRunner(t *testing.T) {
 func TestNewRunnerWithLimit(t *testing.T) {
 	ch := make(chan []runner.JobInterface)
 	r := runner.NewRunnerWithLimit(ch, 10)
-	defer r.Stop()
+	defer r.StopAndWait()
 	if r == nil {
 		t.Fatal("NewRunnerWithLimit returned nil")
 	}

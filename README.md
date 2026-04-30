@@ -1,5 +1,10 @@
 # go-runner
 
+[![test](https://github.com/Sotaneum/go-runner/actions/workflows/test.yml/badge.svg)](https://github.com/Sotaneum/go-runner/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/Sotaneum/go-runner.svg)](https://pkg.go.dev/github.com/Sotaneum/go-runner)
+[![Go Report Card](https://goreportcard.com/badge/github.com/Sotaneum/go-runner)](https://goreportcard.com/report/github.com/Sotaneum/go-runner)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 A small Go library that runs a set of jobs every minute. Each minute the runner asks every registered job whether it should run (`IsRun(now)`), and concurrently executes the ones that say yes — up to a configurable concurrency limit.
 
 - Push the **current set of jobs** to a channel; the runner queues batches internally and evaluates them on each minute tick.
@@ -30,7 +35,7 @@ type Job struct{ id string }
 
 func (j *Job) GetID() string          { return j.id }
 func (j *Job) IsRun(t time.Time) bool { return true } // every minute
-func (j *Job) Run() any               { return "done" }
+func (j *Job) Run() (any, error)      { return "done", nil }
 
 func main() {
     runnerCh := make(chan []runner.JobInterface)
@@ -156,8 +161,8 @@ In-flight `Run()` invocations are not cancelled — `JobInterface` does not curr
 ### Channel ownership
 
 - The caller owns `runnerCh`. Closing it stops the `ingest` goroutine but does not stop the runner — call `Stop()` for that.
-- The library owns `ResultCh`. It is **never closed**; the caller drains for as long as it cares about results.
-- `ResultCh` is buffered (size 8). If the caller falls behind, the oldest result is dropped and `Stats().DroppedResultsTotal` is incremented.
+- The library owns `ResultCh`. It is buffered (size 8) and is closed by `Wait()` (or `StopAndWait`) once all in-flight queues have finished. After close, `range r.ResultCh` exits naturally.
+- If the caller falls behind, the oldest result is dropped and `Stats().DroppedResultsTotal` is incremented.
 
 ## Stats
 
@@ -176,10 +181,11 @@ s := r.Stats()
 |---|---|
 | `NewRunner(runnerCh)` | Create a runner with the default concurrency limit (50). |
 | `NewRunnerWithLimit(runnerCh, limit, opts...)` | Create with custom limit and options. Panics if `runnerCh` is nil. `limit <= 0` normalizes to default. |
-| `(*Runner).Stop()` | Stop lifecycle goroutines. Idempotent. |
-| `(*Runner).Wait()` | Block until in-flight queues complete. |
-| `(*Runner).StopAndWait()` | `Stop` + `Wait`. |
+| `(*Runner).Stop()` | Stop lifecycle goroutines, wait for them to exit. Idempotent. |
+| `(*Runner).Wait()` | Block until in-flight queues complete, then close `ResultCh`. |
+| `(*Runner).StopAndWait()` | `Stop` + `Wait`. After this returns no goroutine from this runner remains. |
 | `(*Runner).Stats()` | Snapshot of operational counters. |
+| `(*Runner).InFlightIDs()` | Currently executing job IDs (only meaningful with `WithDedupe`). |
 | `(*Runner).ResultCh` | Buffered receive channel of `Result`. |
 | `WithDedupe()` | Skip duplicate in-flight IDs. |
 | `WithBatchBuffer(n)` | Set internal batch FIFO size. |
@@ -192,14 +198,25 @@ s := r.Stats()
 type JobInterface interface {
     IsRun(t time.Time) bool // called once per tick at evaluation time
     GetID() string          // stable identifier; result map key (and dedupe key if enabled)
-    Run() any               // executed when IsRun returned true; return value stored in JobResult.Value
+    Run() (any, error)      // executed when IsRun returned true.
+                            // value goes to JobResult.Value, error to JobResult.Err.
+                            // a panic also lands in Err as *PanicError.
 }
 ```
+
+## Examples
+
+Runnable programs in `examples/`:
+
+- [`examples/basic`](./examples/basic) — minimal usage
+- [`examples/dedupe`](./examples/dedupe) — `WithDedupe()` + `Stats`
 
 ## Testing
 
 ```bash
-go test -race ./...
+go test -race ./...               # unit + leak (via go.uber.org/goleak)
+go test -bench=. -benchmem ./...  # benchmarks
+staticcheck ./...                 # style/lint
 ```
 
 ## License

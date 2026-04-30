@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package runner
 
 import (
@@ -36,10 +38,12 @@ func (e *PanicError) Error() string {
 }
 
 // JobInterface : Runner 인터페이스입니다.
+// Run은 결과 값과 에러를 함께 반환합니다. 에러는 JobResult.Err에 그대로 저장되며,
+// Run 내부에서 패닉이 발생하면 Run의 반환값은 무시되고 Err에 *PanicError가 들어갑니다.
 type JobInterface interface {
 	IsRun(t time.Time) bool
 	GetID() string
-	Run() any
+	Run() (any, error)
 }
 
 // JobResult : 한 Job의 실행 결과.
@@ -103,6 +107,10 @@ type Runner struct {
 	done chan struct{}
 	// stopOnce : Stop()이 여러 번 호출되어도 done이 한 번만 close되도록 보호한다.
 	stopOnce sync.Once
+	// closeResultOnce : ResultCh를 한 번만 닫도록 보호한다.
+	closeResultOnce sync.Once
+	// lifecycleWg : start, createQueue, ingest, timeChecker 라이프사이클 고루틴 추적.
+	lifecycleWg sync.WaitGroup
 	// inFlightQueues : 실행 중인 runQueue 고루틴 추적. Wait()가 사용한다.
 	inFlightQueues sync.WaitGroup
 
@@ -120,19 +128,41 @@ type Runner struct {
 }
 
 // Stop : Runner의 라이프사이클 고루틴(start, createQueue, ingest, timeChecker)을 종료한다.
-// 이미 시작된 runQueue / Job 고루틴은 자체 완료까지 진행되며 강제 취소되지 않는다.
+// 라이프사이클 고루틴이 모두 종료될 때까지 동기적으로 대기한다.
+// 이미 시작된 runQueue / Job 고루틴은 자체 완료까지 진행되며 강제 취소되지 않으므로,
+// in-flight 작업까지 마무리하려면 Wait() 또는 StopAndWait()을 사용한다.
 // 여러 번 호출해도 안전(idempotent).
 func (r *Runner) Stop() {
-	r.stopOnce.Do(func() { close(r.done) })
+	r.stopOnce.Do(func() {
+		close(r.done)
+		r.lifecycleWg.Wait()
+	})
 }
 
-// Wait : 현재 in-flight인 모든 runQueue가 완료될 때까지 대기한다.
-// Stop과 결합한 graceful shutdown 패턴에 사용한다.
+// InFlightIDs : 현재 실행 중인 Job ID 목록을 반환한다 (WithDedupe 모드에서만 의미 있음).
+// dedupe가 비활성화된 경우 항상 빈 슬라이스를 반환한다.
+func (r *Runner) InFlightIDs() []string {
+	r.inFlightMu.Lock()
+	defer r.inFlightMu.Unlock()
+	if len(r.inFlight) == 0 {
+		return nil
+	}
+	ids := make([]string, 0, len(r.inFlight))
+	for id := range r.inFlight {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// Wait : 현재 in-flight인 모든 runQueue가 완료될 때까지 대기하고 ResultCh를 닫는다.
+// 보통 Stop 이후에 호출되며, 호출 후에는 `range r.ResultCh` 루프가 자연스럽게 종료된다.
+// ResultCh는 첫 호출에서만 닫히므로 여러 번 호출해도 안전하다.
 func (r *Runner) Wait() {
 	r.inFlightQueues.Wait()
+	r.closeResultOnce.Do(func() { close(r.ResultCh) })
 }
 
-// StopAndWait : Stop을 호출한 뒤 in-flight runQueue 완료를 기다린다.
+// StopAndWait : Stop을 호출한 뒤 in-flight runQueue 완료를 기다리고 ResultCh를 닫는다.
 func (r *Runner) StopAndWait() {
 	r.Stop()
 	r.Wait()
@@ -206,8 +236,10 @@ func (r *Runner) runQueue(queue []JobInterface) {
 			)
 			func() {
 				// 한 Job의 패닉이 프로세스 전체를 죽이지 않도록 라이브러리 레벨에서 recover.
+				// 패닉은 Run의 정상 반환 에러를 덮어쓴다.
 				defer func() {
 					if p := recover(); p != nil {
+						out = nil
 						err = &PanicError{
 							ID:        j.GetID(),
 							Recovered: p,
@@ -215,7 +247,7 @@ func (r *Runner) runQueue(queue []JobInterface) {
 						}
 					}
 				}()
-				out = j.Run()
+				out, err = j.Run()
 			}()
 			appendResult(JobResult{
 				ID:        j.GetID(),
@@ -360,10 +392,11 @@ func NewRunnerWithLimit(runnerCh chan []JobInterface, limit int, opts ...Option)
 		r.inFlight = make(map[string]struct{})
 	}
 
-	go r.start()
-	go r.createQueue()
-	go r.ingest(runnerCh)
-	go timeChecker(r.waitCh, r.done)
+	r.lifecycleWg.Add(4)
+	go func() { defer r.lifecycleWg.Done(); r.start() }()
+	go func() { defer r.lifecycleWg.Done(); r.createQueue() }()
+	go func() { defer r.lifecycleWg.Done(); r.ingest(runnerCh) }()
+	go func() { defer r.lifecycleWg.Done(); timeChecker(r.waitCh, r.done) }()
 
 	return r
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 package runner
 
 import (
@@ -18,7 +20,7 @@ type concJob struct {
 
 func (j *concJob) GetID() string          { return j.id }
 func (j *concJob) IsRun(t time.Time) bool { return true }
-func (j *concJob) Run() any {
+func (j *concJob) Run() (any, error) {
 	if j.running != nil {
 		cur := j.running.Add(1)
 		for {
@@ -32,7 +34,7 @@ func (j *concJob) Run() any {
 	if j.sleep > 0 {
 		time.Sleep(j.sleep)
 	}
-	return j.id
+	return j.id, nil
 }
 
 // resultByID : Result.Items를 ID로 인덱싱한 헬퍼.
@@ -45,7 +47,9 @@ func resultByID(res Result) map[string]JobResult {
 }
 
 // newTestRunner : timeChecker/createQueue/ingest 없이 start()만 띄운 Runner.
-func newTestRunner(limit int) *Runner {
+// t.Cleanup으로 Stop을 자동 등록하여 고루틴 누수를 방지한다.
+func newTestRunner(t *testing.T, limit int) *Runner {
+	t.Helper()
 	if limit <= 0 {
 		limit = defaultConcurrencyLimit
 	}
@@ -57,12 +61,16 @@ func newTestRunner(limit int) *Runner {
 		sem:      make(chan struct{}, limit),
 		done:     make(chan struct{}),
 	}
-	go r.start()
+	r.lifecycleWg.Add(1)
+	go func() { defer r.lifecycleWg.Done(); r.start() }()
+	t.Cleanup(func() {
+		r.StopAndWait()
+	})
 	return r
 }
 
 func TestStartConcurrent(t *testing.T) {
-	r := newTestRunner(50)
+	r := newTestRunner(t, 50)
 	queue := make([]JobInterface, 10)
 	for i := range queue {
 		queue[i] = &concJob{id: fmt.Sprintf("j%d", i), sleep: 100 * time.Millisecond}
@@ -79,7 +87,7 @@ func TestStartConcurrent(t *testing.T) {
 
 func TestStartRespectsLimit(t *testing.T) {
 	var running, maxSeen atomic.Int32
-	r := newTestRunner(3)
+	r := newTestRunner(t, 3)
 	queue := make([]JobInterface, 10)
 	for i := range queue {
 		queue[i] = &concJob{
@@ -97,7 +105,7 @@ func TestStartRespectsLimit(t *testing.T) {
 }
 
 func TestStartResultCollection(t *testing.T) {
-	r := newTestRunner(20)
+	r := newTestRunner(t, 20)
 	queue := make([]JobInterface, 100)
 	for i := range queue {
 		queue[i] = &concJob{id: fmt.Sprintf("j%d", i)}
@@ -137,7 +145,9 @@ func TestNewRunnerWithLimitFallback(t *testing.T) {
 			sem:      make(chan struct{}, effective),
 			done:     make(chan struct{}),
 		}
-		go r.start()
+		r.lifecycleWg.Add(1)
+		go func() { defer r.lifecycleWg.Done(); r.start() }()
+		t.Cleanup(r.StopAndWait)
 		r.queueCh <- []JobInterface{&concJob{id: "x"}}
 		select {
 		case <-r.ResultCh:
@@ -151,7 +161,7 @@ func TestNewRunnerWithLimitFallback(t *testing.T) {
 }
 
 func TestStartAcceptsNextQueueWhileBusy(t *testing.T) {
-	r := newTestRunner(1)
+	r := newTestRunner(t, 1)
 	slow := []JobInterface{&concJob{id: "slow", sleep: 300 * time.Millisecond}}
 	fast := []JobInterface{&concJob{id: "fast"}}
 
@@ -179,7 +189,7 @@ func TestStartAcceptsNextQueueWhileBusy(t *testing.T) {
 
 func TestGlobalLimitAcrossQueues(t *testing.T) {
 	var running, maxSeen atomic.Int32
-	r := newTestRunner(3)
+	r := newTestRunner(t, 3)
 	mkQueue := func(prefix string, n int) []JobInterface {
 		q := make([]JobInterface, n)
 		for i := range q {
@@ -211,21 +221,17 @@ func TestStopReleasesGoroutines(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	ch := make(chan []JobInterface)
 	r := NewRunnerWithLimit(ch, 5)
+	t.Cleanup(r.StopAndWait)
+
 	time.Sleep(50 * time.Millisecond)
 	if delta := runtime.NumGoroutine() - baseline; delta < 4 {
 		t.Fatalf("expected at least 4 new goroutines, got delta=%d", delta)
 	}
 	r.Stop()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		// 다른 테스트와 병행 시 baseline이 이미 여러 개 차이날 수 있으므로,
-		// "Stop 후 라이프사이클 4개가 빠졌는지"를 보수적으로 확인.
-		if runtime.NumGoroutine() <= baseline+2 {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	// Stop은 동기적으로 라이프사이클 종료를 대기하므로, 즉시 검사 가능.
+	if runtime.NumGoroutine() > baseline+2 {
+		t.Errorf("goroutines did not exit after Stop: baseline=%d, current=%d", baseline, runtime.NumGoroutine())
 	}
-	t.Errorf("goroutines did not exit after Stop: baseline=%d, current=%d", baseline, runtime.NumGoroutine())
 }
 
 func TestStopAndWait(t *testing.T) {
@@ -253,10 +259,10 @@ type panicJob struct{ id string }
 
 func (p *panicJob) GetID() string          { return p.id }
 func (p *panicJob) IsRun(t time.Time) bool { return true }
-func (p *panicJob) Run() any               { panic("boom: " + p.id) }
+func (p *panicJob) Run() (any, error)      { panic("boom: " + p.id) }
 
 func TestRunQueueRecoversPanic(t *testing.T) {
-	r := newTestRunner(5)
+	r := newTestRunner(t, 5)
 	queue := []JobInterface{
 		&concJob{id: "ok1"},
 		&panicJob{id: "bad"},
@@ -292,7 +298,7 @@ func TestRunQueueRecoversPanic(t *testing.T) {
 func TestNewRunnerCompat(t *testing.T) {
 	ch := make(chan []JobInterface)
 	r := NewRunner(ch)
-	defer r.Stop()
+	defer r.StopAndWait()
 	if r.limit != defaultConcurrencyLimit {
 		t.Errorf("NewRunner limit = %d, want %d", r.limit, defaultConcurrencyLimit)
 	}
@@ -306,16 +312,16 @@ type slowCountJob struct {
 
 func (j *slowCountJob) GetID() string          { return j.id }
 func (j *slowCountJob) IsRun(t time.Time) bool { return true }
-func (j *slowCountJob) Run() any {
+func (j *slowCountJob) Run() (any, error) {
 	j.count.Add(1)
 	if j.release != nil {
 		<-j.release
 	}
-	return j.id
+	return j.id, nil
 }
 
 func TestWithDedupeSkipsInFlight(t *testing.T) {
-	r := newTestRunner(10)
+	r := newTestRunner(t, 10)
 	r.dedupe = true
 	r.inFlight = make(map[string]struct{})
 
@@ -368,7 +374,7 @@ func TestWithDedupeSkipsInFlight(t *testing.T) {
 func TestNewRunnerWithLimitOptions(t *testing.T) {
 	ch := make(chan []JobInterface)
 	r := NewRunnerWithLimit(ch, 5, WithDedupe(), WithBatchBuffer(10))
-	defer r.Stop()
+	defer r.StopAndWait()
 	if !r.dedupe {
 		t.Error("WithDedupe not applied")
 	}
@@ -383,7 +389,7 @@ func TestNewRunnerWithLimitOptions(t *testing.T) {
 func TestWithBatchBufferBackpressure(t *testing.T) {
 	ch := make(chan []JobInterface)
 	r := NewRunnerWithLimit(ch, 1, WithBatchBuffer(2))
-	defer r.Stop()
+	defer r.StopAndWait()
 
 	for i := 0; i < 3; i++ {
 		select {
@@ -402,13 +408,77 @@ func TestWithBatchBufferBackpressure(t *testing.T) {
 func TestStatsSnapshot(t *testing.T) {
 	ch := make(chan []JobInterface)
 	r := NewRunnerWithLimit(ch, 5, WithDedupe(), WithBatchBuffer(8))
-	defer r.Stop()
+	defer r.StopAndWait()
 	s := r.Stats()
 	if s.BatchQueueCapacity != 8 {
 		t.Errorf("BatchQueueCapacity = %d, want 8", s.BatchQueueCapacity)
 	}
 	if s.InFlightJobs != 0 || s.BatchQueueDepth != 0 {
 		t.Errorf("초기 상태 비어있어야 함, got %+v", s)
+	}
+}
+
+type errJob struct {
+	id  string
+	err error
+}
+
+func (e *errJob) GetID() string          { return e.id }
+func (e *errJob) IsRun(t time.Time) bool { return true }
+func (e *errJob) Run() (any, error)      { return nil, e.err }
+
+func TestRunReturnsErrorPropagated(t *testing.T) {
+	r := newTestRunner(t, 5)
+	want := errors.New("io: closed")
+	r.queueCh <- []JobInterface{&errJob{id: "io", err: want}}
+	res := <-r.ResultCh
+	if len(res.Items) != 1 {
+		t.Fatalf("got %d items, want 1", len(res.Items))
+	}
+	jr := res.Items[0]
+	if jr.Err == nil || jr.Err.Error() != want.Error() {
+		t.Errorf("Err = %v, want %v", jr.Err, want)
+	}
+	if jr.Value != nil {
+		t.Errorf("Value should be nil on error path, got %v", jr.Value)
+	}
+}
+
+func TestInFlightIDs(t *testing.T) {
+	r := newTestRunner(t, 5)
+	r.dedupe = true
+	r.inFlight = make(map[string]struct{})
+
+	release := make(chan struct{})
+	r.queueCh <- []JobInterface{
+		&slowCountJob{id: "x", count: new(atomic.Int32), release: release},
+		&slowCountJob{id: "y", count: new(atomic.Int32), release: release},
+	}
+	// Job들이 release 대기로 들어갈 시간 확보
+	time.Sleep(50 * time.Millisecond)
+	ids := r.InFlightIDs()
+	if len(ids) != 2 {
+		t.Errorf("InFlightIDs len = %d, want 2 (got %v)", len(ids), ids)
+	}
+	close(release)
+	<-r.ResultCh
+	if got := r.InFlightIDs(); len(got) != 0 {
+		t.Errorf("after completion InFlightIDs = %v, want empty", got)
+	}
+}
+
+func TestResultChClosedAfterStopAndWait(t *testing.T) {
+	ch := make(chan []JobInterface)
+	r := NewRunnerWithLimit(ch, 5)
+	r.StopAndWait()
+	select {
+	case _, ok := <-r.ResultCh:
+		if ok {
+			t.Error("ResultCh에서 결과가 수신됨 (큐를 보내지 않았는데)")
+		}
+		// ok==false: 닫힘 — 정상
+	case <-time.After(time.Second):
+		t.Fatal("ResultCh이 StopAndWait 후 닫히지 않음")
 	}
 }
 
