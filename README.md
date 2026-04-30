@@ -2,10 +2,10 @@
 
 A small Go library that runs a set of jobs every minute. Each minute the runner asks every registered job whether it should run (`IsRun(now)`), and concurrently executes the ones that say yes — up to a configurable concurrency limit.
 
-- Push the **current set of jobs** to a channel; the runner snapshots and evaluates them on each minute tick.
+- Push the **current set of jobs** to a channel; the runner queues batches internally and evaluates them on each minute tick.
 - Jobs implement `JobInterface` (`IsRun`, `GetID`, `Run`).
 - Concurrent execution within a tick, with a global concurrency cap.
-- Backpressure-aware batch queue, optional dedupe, panic recovery, graceful shutdown.
+- Backpressure-aware batch queue, optional dedupe, panic recovery, graceful shutdown, runtime stats.
 
 ## Install
 
@@ -19,6 +19,7 @@ go get github.com/Sotaneum/go-runner
 package main
 
 import (
+    "errors"
     "log"
     "time"
 
@@ -27,24 +28,27 @@ import (
 
 type Job struct{ id string }
 
-func (j *Job) GetID() string         { return j.id }
-func (j *Job) IsRun(t time.Time) bool { return true } // run every minute
-func (j *Job) Run() interface{}       { return "done" }
+func (j *Job) GetID() string          { return j.id }
+func (j *Job) IsRun(t time.Time) bool { return true } // every minute
+func (j *Job) Run() any               { return "done" }
 
 func main() {
     runnerCh := make(chan []runner.JobInterface)
     r := runner.NewRunnerWithLimit(runnerCh, 10)
-    defer r.Stop()
+    defer r.StopAndWait()
 
     runnerCh <- []runner.JobInterface{&Job{id: "a"}, &Job{id: "b"}}
 
-    for result := range r.ResultCh {
-        for id, v := range result {
-            if err, ok := v.(error); ok {
-                log.Printf("job %s panicked: %v", id, err)
-                continue
+    for res := range r.ResultCh {
+        for _, jr := range res.Items {
+            switch {
+            case errors.Is(jr.Err, runner.ErrSkippedDuplicate):
+                log.Printf("%s skipped: duplicate in flight", jr.ID)
+            case jr.Err != nil:
+                log.Printf("%s failed: %v", jr.ID, jr.Err) // *runner.PanicError
+            default:
+                log.Printf("%s -> %v (%v)", jr.ID, jr.Value, jr.EndedAt.Sub(jr.StartedAt))
             }
-            log.Printf("job %s -> %v", id, v)
         }
     }
 }
@@ -58,11 +62,11 @@ caller ──[runnerCh]──▶ ingest ──▶ batch FIFO ──▶ createQue
                               minute tick (timeChecker)            └─▶ goroutine per job (capped by limit) ──▶ ResultCh
 ```
 
-- `runnerCh` accepts a **batch** (full job list) at a time. Each push is queued internally; the caller does not need to wait for the previous batch to finish.
+- `runnerCh` accepts a **batch** (full job list) at a time. Each push is queued into the internal FIFO; the caller does not need to wait for the previous batch to finish.
 - Every minute, `createQueue` pops one batch, evaluates `IsRun(now)` on each job, and forwards the surviving jobs to `start`.
 - `start` hands the queue off to a background goroutine and immediately listens for the next queue, so a slow batch never blocks the next tick.
 - Each job runs in its own goroutine, gated by a **global** concurrency semaphore (`limit`).
-- Results for a queue are delivered as a single `map[string]interface{}` on `ResultCh` once all jobs in that queue finish.
+- Results for a queue are delivered as a single `Result` on `ResultCh` once all jobs in that queue finish.
 
 ## Concurrency
 
@@ -86,7 +90,7 @@ r := runner.NewRunnerWithLimit(runnerCh, 10,
 
 ### `WithDedupe()`
 
-Prevents the same `GetID()` from running concurrently. If a job with the same ID is already in flight (within the same queue or across overlapping queues), the duplicate is silently skipped and omitted from the result map.
+Prevents the same `GetID()` from running concurrently. If a job with the same ID is already in flight (within the same queue or across overlapping queues), the duplicate is recorded as `JobResult{ID, Err: ErrSkippedDuplicate}` and `Run()` is not invoked. The skip is also reflected in `Stats().DedupeSkipsTotal`.
 
 ### `WithBatchBuffer(n)`
 
@@ -96,50 +100,99 @@ Sets the size of the internal FIFO queue that holds batches received from `runne
 - If the caller pushes batches faster than they are consumed, the queue fills and subsequent `runnerCh` sends **block**, providing natural backpressure. The caller does not need to manually pace itself.
 - If `IsRun(now)` returns false at the time the batch is finally dequeued (e.g. it lagged behind), that job is dropped from the queue.
 
-## Panic Handling
-
-If `Run()` panics, the library recovers it and stores an `error` value in the result map under the job's ID. Other jobs in the same queue continue to run; the runner stays alive.
+## Result and Errors
 
 ```go
-result := <-r.ResultCh
-for id, v := range result {
-    if err, ok := v.(error); ok {
-        log.Printf("job %s failed: %v", id, err)
-        continue
-    }
-    // v is the value returned by Run()
+type Result struct {
+    StartedAt time.Time
+    EndedAt   time.Time
+    Items     []JobResult
+}
+
+type JobResult struct {
+    ID        string
+    Value     any       // Run() return value, valid only when Err == nil
+    Err       error     // *PanicError, ErrSkippedDuplicate, or nil
+    StartedAt time.Time
+    EndedAt   time.Time
+}
+
+type PanicError struct {
+    ID        string
+    Recovered any
+    Stack     []byte
+}
+```
+
+Distinguish error sources with `errors.As` / `errors.Is`:
+
+```go
+var pe *runner.PanicError
+switch {
+case errors.As(jr.Err, &pe):
+    log.Printf("%s panicked: %v\n%s", pe.ID, pe.Recovered, pe.Stack)
+case errors.Is(jr.Err, runner.ErrSkippedDuplicate):
+    // skipped by WithDedupe
+case jr.Err != nil:
+    // (none currently produced, reserved for future)
 }
 ```
 
 ## Lifecycle
 
-Call `Stop()` to terminate the runner's internal goroutines (`start`, `createQueue`, `ingest`, `timeChecker`). It is safe to call multiple times.
-
 ```go
 r := runner.NewRunner(runnerCh)
-defer r.Stop()
+defer r.StopAndWait() // graceful: stop accepting new work and wait for in-flight queues
 ```
 
-In-flight `Run()` calls are **not** cancelled (the current `JobInterface` exposes no context); they run to completion. `Stop()` only stops new work from being scheduled.
+| Method | Behavior |
+|---|---|
+| `Stop()` | Closes lifecycle goroutines (`start`, `createQueue`, `ingest`, `timeChecker`). In-flight `Run()` calls continue. Idempotent. |
+| `Wait()` | Blocks until all in-flight `runQueue` goroutines complete. |
+| `StopAndWait()` | `Stop()` followed by `Wait()`. |
+
+In-flight `Run()` invocations are not cancelled — `JobInterface` does not currently expose a `context.Context`.
+
+### Channel ownership
+
+- The caller owns `runnerCh`. Closing it stops the `ingest` goroutine but does not stop the runner — call `Stop()` for that.
+- The library owns `ResultCh`. It is **never closed**; the caller drains for as long as it cares about results.
+- `ResultCh` is buffered (size 8). If the caller falls behind, the oldest result is dropped and `Stats().DroppedResultsTotal` is incremented.
+
+## Stats
+
+```go
+s := r.Stats()
+// s.InFlightJobs        — currently executing jobs (semaphore depth)
+// s.BatchQueueDepth     — batches waiting to be consumed by createQueue
+// s.BatchQueueCapacity  — configured via WithBatchBuffer
+// s.DedupeSkipsTotal    — cumulative duplicate skips
+// s.DroppedResultsTotal — cumulative ResultCh overflow drops
+```
 
 ## API
 
 | Function / Method | Description |
 |---|---|
-| `NewRunner(runnerCh)` | Create a runner with the default concurrency limit (50) and default options. |
-| `NewRunnerWithLimit(runnerCh, limit, opts...)` | Create a runner with a custom limit and options. Panics if `runnerCh` is nil. `limit <= 0` is normalized to the default. |
+| `NewRunner(runnerCh)` | Create a runner with the default concurrency limit (50). |
+| `NewRunnerWithLimit(runnerCh, limit, opts...)` | Create with custom limit and options. Panics if `runnerCh` is nil. `limit <= 0` normalizes to default. |
 | `(*Runner).Stop()` | Stop lifecycle goroutines. Idempotent. |
-| `(*Runner).ResultCh` | Receive-only stream of per-queue result maps. Buffered; if the caller falls behind, oldest results are dropped. |
-| `WithDedupe()` | Skip jobs whose `GetID()` is already in flight. |
+| `(*Runner).Wait()` | Block until in-flight queues complete. |
+| `(*Runner).StopAndWait()` | `Stop` + `Wait`. |
+| `(*Runner).Stats()` | Snapshot of operational counters. |
+| `(*Runner).ResultCh` | Buffered receive channel of `Result`. |
+| `WithDedupe()` | Skip duplicate in-flight IDs. |
 | `WithBatchBuffer(n)` | Set internal batch FIFO size. |
+| `ErrSkippedDuplicate` | Sentinel error for dedupe skips. |
+| `PanicError` | Wraps a recovered `Run()` panic with `Recovered` and `Stack`. |
 
 ### `JobInterface`
 
 ```go
 type JobInterface interface {
     IsRun(t time.Time) bool // called once per tick at evaluation time
-    GetID() string          // stable identifier; used as the result map key (and dedupe key if enabled)
-    Run() interface{}       // executed when IsRun returned true; return value is stored in the result map
+    GetID() string          // stable identifier; result map key (and dedupe key if enabled)
+    Run() any               // executed when IsRun returned true; return value stored in JobResult.Value
 }
 ```
 

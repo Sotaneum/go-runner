@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync/atomic"
@@ -15,9 +16,9 @@ type concJob struct {
 	maxSeen *atomic.Int32
 }
 
-func (j *concJob) GetID() string         { return j.id }
+func (j *concJob) GetID() string          { return j.id }
 func (j *concJob) IsRun(t time.Time) bool { return true }
-func (j *concJob) Run() interface{} {
+func (j *concJob) Run() any {
 	if j.running != nil {
 		cur := j.running.Add(1)
 		for {
@@ -34,7 +35,16 @@ func (j *concJob) Run() interface{} {
 	return j.id
 }
 
-// newTestRunner : timeChecker/dispatchRunner 없이 start()만 띄운 Runner.
+// resultByID : Result.Items를 ID로 인덱싱한 헬퍼.
+func resultByID(res Result) map[string]JobResult {
+	m := make(map[string]JobResult, len(res.Items))
+	for _, it := range res.Items {
+		m[it.ID] = it
+	}
+	return m
+}
+
+// newTestRunner : timeChecker/createQueue/ingest 없이 start()만 띄운 Runner.
 func newTestRunner(limit int) *Runner {
 	if limit <= 0 {
 		limit = defaultConcurrencyLimit
@@ -42,7 +52,7 @@ func newTestRunner(limit int) *Runner {
 	r := &Runner{
 		waitCh:   make(chan bool),
 		queueCh:  make(chan []JobInterface),
-		ResultCh: make(chan map[string]interface{}, 16),
+		ResultCh: make(chan Result, 16),
 		limit:    limit,
 		sem:      make(chan struct{}, limit),
 		done:     make(chan struct{}),
@@ -61,8 +71,9 @@ func TestStartConcurrent(t *testing.T) {
 	r.queueCh <- queue
 	<-r.ResultCh
 	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("expected concurrent execution under 200ms, got %v", elapsed)
+	// 직렬이면 1000ms, 동시면 ~100ms. 느린 CI 마진 포함 500ms.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("expected concurrent execution under 500ms, got %v", elapsed)
 	}
 }
 
@@ -92,14 +103,23 @@ func TestStartResultCollection(t *testing.T) {
 		queue[i] = &concJob{id: fmt.Sprintf("j%d", i)}
 	}
 	r.queueCh <- queue
-	result := <-r.ResultCh
-	if len(result) != 100 {
-		t.Fatalf("got %d results, want 100", len(result))
+	res := <-r.ResultCh
+	if len(res.Items) != 100 {
+		t.Fatalf("got %d items, want 100", len(res.Items))
 	}
+	byID := resultByID(res)
 	for i := 0; i < 100; i++ {
 		id := fmt.Sprintf("j%d", i)
-		if result[id] != id {
-			t.Errorf("result[%s] = %v, want %s", id, result[id], id)
+		jr, ok := byID[id]
+		if !ok {
+			t.Errorf("missing result for %s", id)
+			continue
+		}
+		if jr.Err != nil {
+			t.Errorf("%s: unexpected err %v", id, jr.Err)
+		}
+		if jr.Value != id {
+			t.Errorf("%s: value=%v want %s", id, jr.Value, id)
 		}
 	}
 }
@@ -112,7 +132,7 @@ func TestNewRunnerWithLimitFallback(t *testing.T) {
 		}
 		r := &Runner{
 			queueCh:  make(chan []JobInterface),
-			ResultCh: make(chan map[string]interface{}, 1),
+			ResultCh: make(chan Result, 1),
 			limit:    effective,
 			sem:      make(chan struct{}, effective),
 			done:     make(chan struct{}),
@@ -131,25 +151,22 @@ func TestNewRunnerWithLimitFallback(t *testing.T) {
 }
 
 func TestStartAcceptsNextQueueWhileBusy(t *testing.T) {
-	// limit 1로 시작해도 start()는 큐 수신을 막지 않아야 한다.
 	r := newTestRunner(1)
 	slow := []JobInterface{&concJob{id: "slow", sleep: 300 * time.Millisecond}}
 	fast := []JobInterface{&concJob{id: "fast"}}
 
 	r.queueCh <- slow
-	// slow가 아직 도는 동안 다음 큐 수신이 즉시 가능해야 함
 	select {
 	case r.queueCh <- fast:
 	case <-time.After(50 * time.Millisecond):
 		t.Fatal("start()가 다음 큐를 즉시 수신하지 못함")
 	}
-	// fast도 limit=1에 걸려 slow가 끝난 뒤 실행된다.
 	got := map[string]bool{}
 	for i := 0; i < 2; i++ {
 		select {
 		case res := <-r.ResultCh:
-			for id := range res {
-				got[id] = true
+			for _, it := range res.Items {
+				got[it.ID] = true
 			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("ResultCh 수신 timeout (i=%d)", i)
@@ -161,7 +178,6 @@ func TestStartAcceptsNextQueueWhileBusy(t *testing.T) {
 }
 
 func TestGlobalLimitAcrossQueues(t *testing.T) {
-	// 큐가 겹쳐 실행되더라도 전역 limit이 지켜져야 한다.
 	var running, maxSeen atomic.Int32
 	r := newTestRunner(3)
 	mkQueue := func(prefix string, n int) []JobInterface {
@@ -195,16 +211,16 @@ func TestStopReleasesGoroutines(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	ch := make(chan []JobInterface)
 	r := NewRunnerWithLimit(ch, 5)
-	// 4개 라이프사이클 고루틴 (start, createQueue, dispatchRunner, timeChecker) 시작 대기
 	time.Sleep(50 * time.Millisecond)
-	if runtime.NumGoroutine() < baseline+4 {
-		t.Fatalf("expected at least 4 new goroutines, got delta=%d", runtime.NumGoroutine()-baseline)
+	if delta := runtime.NumGoroutine() - baseline; delta < 4 {
+		t.Fatalf("expected at least 4 new goroutines, got delta=%d", delta)
 	}
 	r.Stop()
-	// 종료 대기 — dispatchRunner가 1초 sleep 중일 수 있어 여유 있게.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if runtime.NumGoroutine() <= baseline+1 {
+		// 다른 테스트와 병행 시 baseline이 이미 여러 개 차이날 수 있으므로,
+		// "Stop 후 라이프사이클 4개가 빠졌는지"를 보수적으로 확인.
+		if runtime.NumGoroutine() <= baseline+2 {
 			return
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -212,11 +228,32 @@ func TestStopReleasesGoroutines(t *testing.T) {
 	t.Errorf("goroutines did not exit after Stop: baseline=%d, current=%d", baseline, runtime.NumGoroutine())
 }
 
+func TestStopAndWait(t *testing.T) {
+	// Wait의 in-flight 대기 의미를 검증: 직접 inFlightQueues에 Add/Done하여
+	// 같은 테스트 고루틴 내에서 happens-before를 명확히 한 뒤 StopAndWait이
+	// Done 호출까지 블로킹되는지 확인한다.
+	ch := make(chan []JobInterface)
+	r := NewRunnerWithLimit(ch, 5)
+
+	r.inFlightQueues.Add(1)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		r.inFlightQueues.Done()
+	}()
+
+	start := time.Now()
+	r.StopAndWait()
+	elapsed := time.Since(start)
+	if elapsed < 100*time.Millisecond {
+		t.Errorf("StopAndWait이 in-flight 작업을 기다리지 않음: elapsed=%v", elapsed)
+	}
+}
+
 type panicJob struct{ id string }
 
-func (p *panicJob) GetID() string         { return p.id }
+func (p *panicJob) GetID() string          { return p.id }
 func (p *panicJob) IsRun(t time.Time) bool { return true }
-func (p *panicJob) Run() interface{}      { panic("boom: " + p.id) }
+func (p *panicJob) Run() any               { panic("boom: " + p.id) }
 
 func TestRunQueueRecoversPanic(t *testing.T) {
 	r := newTestRunner(5)
@@ -228,14 +265,24 @@ func TestRunQueueRecoversPanic(t *testing.T) {
 	r.queueCh <- queue
 	select {
 	case res := <-r.ResultCh:
-		if len(res) != 3 {
-			t.Fatalf("got %d results, want 3", len(res))
+		if len(res.Items) != 3 {
+			t.Fatalf("got %d items, want 3", len(res.Items))
 		}
-		if _, ok := res["bad"].(error); !ok {
-			t.Errorf("expected error for panicked job, got %T: %v", res["bad"], res["bad"])
+		byID := resultByID(res)
+		bad := byID["bad"]
+		var perr *PanicError
+		if !errors.As(bad.Err, &perr) {
+			t.Errorf("expected *PanicError for panicked job, got %T: %v", bad.Err, bad.Err)
+		} else {
+			if perr.ID != "bad" {
+				t.Errorf("PanicError.ID = %q, want %q", perr.ID, "bad")
+			}
+			if len(perr.Stack) == 0 {
+				t.Error("PanicError.Stack is empty")
+			}
 		}
-		if res["ok1"] != "ok1" || res["ok2"] != "ok2" {
-			t.Errorf("non-panicked jobs should complete normally, got %v / %v", res["ok1"], res["ok2"])
+		if byID["ok1"].Value != "ok1" || byID["ok2"].Value != "ok2" {
+			t.Errorf("non-panicked jobs should complete normally")
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ResultCh timeout — panic likely killed the goroutine")
@@ -243,7 +290,6 @@ func TestRunQueueRecoversPanic(t *testing.T) {
 }
 
 func TestNewRunnerCompat(t *testing.T) {
-	// 컴파일 가능 + 패닉 없이 생성되는지 확인
 	ch := make(chan []JobInterface)
 	r := NewRunner(ch)
 	defer r.Stop()
@@ -258,9 +304,9 @@ type slowCountJob struct {
 	release chan struct{}
 }
 
-func (j *slowCountJob) GetID() string         { return j.id }
+func (j *slowCountJob) GetID() string          { return j.id }
 func (j *slowCountJob) IsRun(t time.Time) bool { return true }
-func (j *slowCountJob) Run() interface{} {
+func (j *slowCountJob) Run() any {
 	j.count.Add(1)
 	if j.release != nil {
 		<-j.release
@@ -277,24 +323,45 @@ func TestWithDedupeSkipsInFlight(t *testing.T) {
 	release := make(chan struct{})
 	queue := []JobInterface{
 		&slowCountJob{id: "dup", count: &count, release: release},
-		&slowCountJob{id: "dup", count: &count, release: release}, // 중복 — 스킵되어야 함
+		&slowCountJob{id: "dup", count: &count, release: release},
 		&slowCountJob{id: "uniq", count: &count, release: release},
 	}
 	r.queueCh <- queue
-	// 두 Job(dup 1번 + uniq)이 release 대기 중인지 확인
 	time.Sleep(50 * time.Millisecond)
 	close(release)
 
 	select {
 	case res := <-r.ResultCh:
-		if len(res) != 2 {
-			t.Errorf("expected 2 results (dup + uniq, 2nd dup skipped), got %d: %v", len(res), res)
+		if len(res.Items) != 3 {
+			t.Errorf("expected 3 items (dup OK, dup skipped, uniq OK), got %d: %+v", len(res.Items), res.Items)
+		}
+		// dup 두 항목 중 하나는 ErrSkippedDuplicate, 다른 하나는 정상 결과
+		var dupOK, dupSkipped, uniqOK int
+		for _, it := range res.Items {
+			switch it.ID {
+			case "dup":
+				if errors.Is(it.Err, ErrSkippedDuplicate) {
+					dupSkipped++
+				} else if it.Err == nil {
+					dupOK++
+				}
+			case "uniq":
+				if it.Err == nil {
+					uniqOK++
+				}
+			}
+		}
+		if dupOK != 1 || dupSkipped != 1 || uniqOK != 1 {
+			t.Errorf("dupOK=%d dupSkipped=%d uniqOK=%d, want 1/1/1", dupOK, dupSkipped, uniqOK)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ResultCh timeout")
 	}
 	if c := count.Load(); c != 2 {
 		t.Errorf("Run() invocations = %d, want 2", c)
+	}
+	if r.dedupeSkips.Load() != 1 {
+		t.Errorf("dedupeSkips counter = %d, want 1", r.dedupeSkips.Load())
 	}
 }
 
@@ -318,7 +385,6 @@ func TestWithBatchBufferBackpressure(t *testing.T) {
 	r := NewRunnerWithLimit(ch, 1, WithBatchBuffer(2))
 	defer r.Stop()
 
-	// 내부 큐 용량 2 + ingest 고루틴이 1개 임시로 들고 있을 수 있어 총 3개까지 즉시 수용 가능
 	for i := 0; i < 3; i++ {
 		select {
 		case ch <- []JobInterface{&concJob{id: fmt.Sprintf("j%d", i)}}:
@@ -326,11 +392,48 @@ func TestWithBatchBufferBackpressure(t *testing.T) {
 			t.Fatalf("push %d 블로킹 — 큐가 즉시 수용해야 함", i)
 		}
 	}
-	// 4번째는 큐가 가득 + ingest도 막혀서 블로킹되어야 함 (다음 분 tick 전까지 빠지지 않음)
 	select {
 	case ch <- []JobInterface{&concJob{id: "blocked"}}:
 		t.Error("4번째 push가 블로킹되어야 하는데 즉시 수용됨")
 	case <-time.After(200 * time.Millisecond):
-		// 기대된 블로킹
+	}
+}
+
+func TestStatsSnapshot(t *testing.T) {
+	ch := make(chan []JobInterface)
+	r := NewRunnerWithLimit(ch, 5, WithDedupe(), WithBatchBuffer(8))
+	defer r.Stop()
+	s := r.Stats()
+	if s.BatchQueueCapacity != 8 {
+		t.Errorf("BatchQueueCapacity = %d, want 8", s.BatchQueueCapacity)
+	}
+	if s.InFlightJobs != 0 || s.BatchQueueDepth != 0 {
+		t.Errorf("초기 상태 비어있어야 함, got %+v", s)
+	}
+}
+
+func TestSetResultDropsOldestOnOverflow(t *testing.T) {
+	r := &Runner{
+		ResultCh: make(chan Result, 2),
+	}
+	// 버퍼 크기 2 — 3번째부터 가장 오래된 것이 드롭됨
+	r.setResult(Result{Items: []JobResult{{ID: "a"}}})
+	r.setResult(Result{Items: []JobResult{{ID: "b"}}})
+	r.setResult(Result{Items: []JobResult{{ID: "c"}}})
+	if r.droppedResults.Load() != 1 {
+		t.Errorf("droppedResults = %d, want 1", r.droppedResults.Load())
+	}
+	// 채널에 b, c만 남아있어야 함
+	got := []string{}
+	for len(got) < 2 {
+		select {
+		case res := <-r.ResultCh:
+			got = append(got, res.Items[0].ID)
+		default:
+			t.Fatalf("결과 부족: %v", got)
+		}
+	}
+	if got[0] != "b" || got[1] != "c" {
+		t.Errorf("남은 결과 = %v, want [b, c]", got)
 	}
 }

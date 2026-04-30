@@ -12,14 +12,14 @@ type data struct {
 	use bool
 }
 
-func (d *data) GetID() string         { return d.id }
+func (d *data) GetID() string          { return d.id }
 func (d *data) IsRun(t time.Time) bool { return d.use }
-func (d *data) Run() interface{}      { return "{code:200}" }
+func (d *data) Run() any               { return "{code:200}" }
 
-// TestNewRunner : 공개 API가 컴파일되고 정상적으로 인스턴스를 만드는지 확인.
 func TestNewRunner(t *testing.T) {
 	ch := make(chan []runner.JobInterface)
 	r := runner.NewRunner(ch)
+	defer r.Stop()
 	if r == nil {
 		t.Fatal("NewRunner returned nil")
 	}
@@ -31,6 +31,7 @@ func TestNewRunner(t *testing.T) {
 func TestNewRunnerWithLimit(t *testing.T) {
 	ch := make(chan []runner.JobInterface)
 	r := runner.NewRunnerWithLimit(ch, 10)
+	defer r.Stop()
 	if r == nil {
 		t.Fatal("NewRunnerWithLimit returned nil")
 	}
@@ -43,7 +44,7 @@ func TestStopIdempotent(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		r.Stop()
-		r.Stop() // 두 번째 호출이 panic하지 않아야 함
+		r.Stop()
 		close(done)
 	}()
 	select {
