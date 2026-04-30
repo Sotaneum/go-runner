@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -187,6 +188,27 @@ func TestGlobalLimitAcrossQueues(t *testing.T) {
 	if m := maxSeen.Load(); m > 3 {
 		t.Errorf("global concurrent = %d, want <= 3", m)
 	}
+}
+
+func TestStopReleasesGoroutines(t *testing.T) {
+	baseline := runtime.NumGoroutine()
+	ch := make(chan []JobInterface)
+	r := NewRunnerWithLimit(ch, 5)
+	// 4개 라이프사이클 고루틴 (start, createQueue, dispatchRunner, timeChecker) 시작 대기
+	time.Sleep(50 * time.Millisecond)
+	if runtime.NumGoroutine() < baseline+4 {
+		t.Fatalf("expected at least 4 new goroutines, got delta=%d", runtime.NumGoroutine()-baseline)
+	}
+	r.Stop()
+	// 종료 대기 — dispatchRunner가 1초 sleep 중일 수 있어 여유 있게.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= baseline+1 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("goroutines did not exit after Stop: baseline=%d, current=%d", baseline, runtime.NumGoroutine())
 }
 
 type panicJob struct{ id string }
